@@ -130,6 +130,9 @@ class WorkScheduleGenerator:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
         
+        # Reset work hours tracking
+        self.staff_work_hours = defaultdict(float)
+        
         initial_schedule = self._generate_initial_schedule(start_date, end_date)
         balanced_schedule = self._balance_workload(initial_schedule, start_date, end_date)
         
@@ -288,15 +291,191 @@ class WorkScheduleGenerator:
     
     def _balance_workload(self, schedule, start_date, end_date):
         """Balance workload using reassignment while maintaining lab consistency"""
-        # The workload balancing is already handled in the assignment process
-        # This method can be used for fine-tuning if needed
+        max_iterations = 5
+        improvement_threshold = 0.5  # Minimum improvement to continue balancing
+        
+        print("Bắt đầu cân bằng workload...")
+        
+        for iteration in range(max_iterations):
+            # Calculate current workload statistics
+            current_work_hours = self.staff_work_hours.copy()
+            
+            if not current_work_hours:
+                break
+                
+            # Calculate workload variance
+            work_values = list(current_work_hours.values())
+            if len(work_values) <= 1:
+                break
+                
+            avg_hours = sum(work_values) / len(work_values)
+            variance_before = sum((hours - avg_hours) ** 2 for hours in work_values) / len(work_values)
+            
+            # Try to reassign shifts to balance workload
+            improved = self._reassign_shifts(schedule, current_work_hours)
+            
+            if not improved:
+                print(f"Không thể cải thiện thêm sau {iteration + 1} vòng lặp")
+                break
+                
+            # Calculate new variance
+            new_work_values = list(self.staff_work_hours.values())
+            new_avg_hours = sum(new_work_values) / len(new_work_values)
+            variance_after = sum((hours - new_avg_hours) ** 2 for hours in new_work_values) / len(new_work_values)
+            
+            # Check if improvement is significant
+            improvement = variance_before - variance_after
+            if improvement < improvement_threshold:
+                print(f"Cải thiện không đáng kể ({improvement:.2f}), dừng tối ưu hóa")
+                break
+                
+            print(f"Vòng {iteration + 1}: Phương sai giảm từ {variance_before:.2f} xuống {variance_after:.2f}")
+        
+        # Print final workload distribution
+        print("\nPhân bổ giờ làm cuối cùng:")
+        for staff, hours in sorted(self.staff_work_hours.items()):
+            print(f"  {staff}: {hours:.1f} giờ")
+        
         return schedule
     
     def _reassign_shifts(self, schedule, work_hours):
         """Try to reassign shifts to balance workload while maintaining lab consistency"""
-        # Implementation for reassignment while keeping lab consistency
-        # This is more complex due to the lab consistency requirement
-        pass
+        if not work_hours:
+            return False
+            
+        # Find overloaded and underloaded staff
+        work_values = list(work_hours.values())
+        avg_hours = sum(work_values) / len(work_values)
+        
+        overloaded_staff = []
+        underloaded_staff = []
+        
+        for staff, hours in work_hours.items():
+            if hours > avg_hours + 2:  # Threshold for overloaded
+                overloaded_staff.append((staff, hours))
+            elif hours < avg_hours - 2:  # Threshold for underloaded
+                underloaded_staff.append((staff, hours))
+        
+        if not overloaded_staff or not underloaded_staff:
+            return False
+        
+        # Sort by workload difference
+        overloaded_staff.sort(key=lambda x: x[1], reverse=True)
+        underloaded_staff.sort(key=lambda x: x[1])
+        
+        improvements_made = False
+        
+        # Try to reassign shifts
+        for day_info in schedule:
+            date = day_info['date']
+            assignments = day_info['assignments']
+            
+            # Check each shift type
+            for shift_type in ['morning', 'afternoon1', 'afternoon2']:
+                shift_hours = 3 if shift_type == 'morning' else 2.5
+                
+                # Look for reassignment opportunities
+                for lab in ['lab01', 'lab02', 'lab03']:
+                    current_staff = assignments[shift_type][lab]
+                    
+                    if not current_staff:
+                        continue
+                        
+                    # Check if current staff is overloaded
+                    current_staff_hours = work_hours.get(current_staff, 0)
+                    if current_staff_hours <= avg_hours + 1:
+                        continue
+                    
+                    # Find a suitable replacement from underloaded staff
+                    best_replacement = None
+                    best_replacement_hours = float('inf')
+                    
+                    for replacement_staff, replacement_hours in underloaded_staff:
+                        # Check if replacement can work this shift
+                        can_work, available_hours = self.get_staff_availability(replacement_staff, date, shift_type)
+                        
+                        if not can_work or available_hours < shift_hours:
+                            continue
+                        
+                        # Check if this replacement would improve balance
+                        if replacement_hours < best_replacement_hours and replacement_hours < current_staff_hours - 1:
+                            # Additional check: ensure this doesn't conflict with existing assignments
+                            if not self._would_create_conflict(assignments, replacement_staff, shift_type, lab, date):
+                                best_replacement = replacement_staff
+                                best_replacement_hours = replacement_hours
+                    
+                    # Make the reassignment if beneficial
+                    if best_replacement:
+                        # Update assignments
+                        assignments[shift_type][lab] = best_replacement
+                        
+                        # Update work hours tracking
+                        work_hours[current_staff] -= shift_hours
+                        work_hours[best_replacement] += shift_hours
+                        self.staff_work_hours[current_staff] -= shift_hours
+                        self.staff_work_hours[best_replacement] += shift_hours
+                        
+                        # Update the underloaded/overloaded lists
+                        underloaded_staff = [(staff, hours) for staff, hours in underloaded_staff 
+                                           if staff != best_replacement]
+                        if work_hours[best_replacement] < avg_hours - 2:
+                            underloaded_staff.append((best_replacement, work_hours[best_replacement]))
+                        
+                        if work_hours[current_staff] < avg_hours + 2:
+                            overloaded_staff = [(staff, hours) for staff, hours in overloaded_staff 
+                                              if staff != current_staff]
+                        
+                        improvements_made = True
+                        
+                        # Try to maintain lab consistency by reassigning other shifts of the same lab
+                        self._try_maintain_lab_consistency(assignments, date, lab, best_replacement, current_staff)
+        
+        return improvements_made
+    
+    def _would_create_conflict(self, assignments, staff, shift_type, lab, date):
+        """Check if assigning staff to a shift would create conflicts"""
+        # Check if staff is already assigned to another lab in the same shift
+        for other_lab in ['lab01', 'lab02', 'lab03']:
+            if other_lab != lab and assignments[shift_type][other_lab] == staff:
+                return True
+        
+        # Check if staff is already assigned to a different lab in other shifts of the same day
+        # This is actually allowed, but we want to maintain some consistency
+        other_shifts = [s for s in ['morning', 'afternoon1', 'afternoon2'] if s != shift_type]
+        staff_other_labs = set()
+        
+        for other_shift in other_shifts:
+            for other_lab in ['lab01', 'lab02', 'lab03']:
+                if assignments[other_shift][other_lab] == staff:
+                    staff_other_labs.add(other_lab)
+        
+        # Prefer to assign to the same lab if staff is already working other shifts
+        if staff_other_labs and lab not in staff_other_labs:
+            # Check if the preferred lab is available
+            for preferred_lab in staff_other_labs:
+                if not assignments[shift_type][preferred_lab]:
+                    return True  # Prefer the consistent lab assignment
+        
+        return False
+    
+    def _try_maintain_lab_consistency(self, assignments, date, lab, new_staff, old_staff):
+        """Try to maintain lab consistency by reassigning other shifts"""
+        shifts = ['morning', 'afternoon1', 'afternoon2']
+        
+        for shift_type in shifts:
+            if assignments[shift_type][lab] == old_staff:
+                # Check if new_staff can work this shift too
+                can_work, _ = self.get_staff_availability(new_staff, date, shift_type)
+                if can_work:
+                    # Check if this wouldn't create conflicts
+                    if not self._would_create_conflict(assignments, new_staff, shift_type, lab, date):
+                        # Make the reassignment for consistency
+                        assignments[shift_type][lab] = new_staff
+                        
+                        # Update work hours
+                        shift_hours = 3 if shift_type == 'morning' else 2.5
+                        self.staff_work_hours[old_staff] -= shift_hours
+                        self.staff_work_hours[new_staff] += shift_hours
     
     def save_to_excel(self, schedule, filename):
         """Save schedule to Excel file with formatting"""
@@ -400,51 +579,48 @@ class WorkScheduleGenerator:
             ws.column_dimensions[column].width = adjusted_width
         
         wb.save(filename)
-    
+        print(f"Lịch làm việc đã được lưu vào file: {filename}")
+
     def save_to_csv(self, schedule, filename):
         """Save schedule to CSV file as fallback"""
-        csv_data = []
-        csv_data.append(['Date', 'Thứ', 'TYPE', 'Lab01', 'Lab02', 'Lab03'])
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Header
+            writer.writerow(['Date', 'Thứ', 'TYPE', 'Lab01', 'Lab02', 'Lab03'])
+            
+            # Data rows
+            for day_info in schedule:
+                date = day_info['date']
+                date_str = date.strftime('%d/%m/%Y')
+                weekday_str = f"Thứ {date.weekday() + 2}"
+                assignments = day_info['assignments']
+                
+                # Morning shift
+                writer.writerow([
+                    date_str, weekday_str, 'Sáng (09:00~12:00)',
+                    assignments['morning']['lab01'],
+                    assignments['morning']['lab02'],
+                    assignments['morning']['lab03']
+                ])
+                
+                # Afternoon shift 1
+                writer.writerow([
+                    date_str, weekday_str, 'Chiều (13:30 ~ 16:00)',
+                    assignments['afternoon1']['lab01'],
+                    assignments['afternoon1']['lab02'],
+                    assignments['afternoon1']['lab03']
+                ])
+                
+                # Afternoon shift 2
+                writer.writerow([
+                    date_str, weekday_str, 'Chiều (16:00 ~ 18:30)',
+                    assignments['afternoon2']['lab01'],
+                    assignments['afternoon2']['lab02'],
+                    assignments['afternoon2']['lab03']
+                ])
         
-        for day_info in schedule:
-            date = day_info['date']
-            date_str = date.strftime('%d/%m/%Y')
-            weekday_str = f"Thứ {date.weekday() + 2}"
-            assignments = day_info['assignments']
-            
-            morning_row = [
-                date_str,
-                weekday_str,
-                'Sáng (09:00~12:00)',
-                assignments['morning']['lab01'],
-                assignments['morning']['lab02'],
-                assignments['morning']['lab03']
-            ]
-            csv_data.append(morning_row)
-            
-            afternoon1_row = [
-                date_str,
-                weekday_str,
-                'Chiều (13:30 ~ 16:00)',
-                assignments['afternoon1']['lab01'],
-                assignments['afternoon1']['lab02'],
-                assignments['afternoon1']['lab03']
-            ]
-            csv_data.append(afternoon1_row)
-            
-            afternoon2_row = [
-                date_str,
-                weekday_str,
-                'Chiều (16:00 ~ 18:30)',
-                assignments['afternoon2']['lab01'],
-                assignments['afternoon2']['lab02'],
-                assignments['afternoon2']['lab03']
-            ]
-            csv_data.append(afternoon2_row)
-        
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerows(csv_data)
+        print(f"Lịch làm việc đã được lưu vào file CSV: {filename}")
 
 def get_auto_date_range():
     """Get automatic date range for schedule"""
@@ -466,10 +642,15 @@ def get_auto_date_range():
 
 def main():
     """Main function"""
+    print("=== HỆ THỐNG TẠO LỊCH LÀM VIỆC ===")
     start_date, end_date = get_auto_date_range()
+    print(f"Tạo lịch từ {start_date} đến {end_date}")
+    
     scheduler = WorkScheduleGenerator()
     schedule = scheduler.generate_schedule(start_date, end_date)
     scheduler.save_to_excel(schedule, 'work_schedule.xlsx')
+    
+    print("Hoàn thành!")
 
 if __name__ == "__main__":
     main()
